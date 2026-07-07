@@ -76,6 +76,23 @@
     background: rgba(34,211,238,0.15); color: #7fe6f7; border: 1px solid rgba(34,211,238,0.35); margin-left: 8px; }
   .chart-wrap { max-width: 100%; height: 300px; }
 
+  /* Price Trend chart tooltip (hover on a data point shows model / config / date / price) */
+  .chart-tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: rgba(16,19,31,0.97);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 11px;
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--text);
+    box-shadow: 0 14px 34px -10px rgba(0,0,0,0.7);
+    z-index: 30;
+    display: none;
+    white-space: nowrap;
+  }
+
   .filter-bar { position: relative; z-index: 20; display: flex; flex-wrap: wrap; gap: 14px; align-items: flex-end; padding: 16px 18px; margin-bottom: 16px; }
   .filter-field { display: flex; flex-direction: column; gap: 6px; min-width: 190px; }
   .filter-field label { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.6px; color: var(--muted); font-weight: 600; }
@@ -195,7 +212,10 @@
         <select id="trend-filter-model"><option value="">All (top 5 by listing order)</option></select>
       </div>
     </div>
-    <div class="chart-wrap" id="trendChartWrap"></div>
+    <div class="chart-wrap" id="trendChartWrap" style="position:relative;">
+      <div id="trendChartInner" style="height:100%;"></div>
+      <div class="chart-tooltip" id="trendTooltip"></div>
+    </div>
   </div>
 
   <div class="glow-card panel">
@@ -544,16 +564,19 @@ async function getRealTrend(sku) {
 }
 
 async function renderTrendChart() {
-  const wrap = document.getElementById('trendChartWrap');
+  const wrap = document.getElementById('trendChartInner');
+  const outerWrap = document.getElementById('trendChartWrap');
+  const tooltip = document.getElementById('trendTooltip');
   const note = document.getElementById('trend-note');
   const badge = document.getElementById('trend-days-badge');
+  if (tooltip) tooltip.style.display = 'none';
 
   const brandPool = allProducts.filter(p => p.brand === trendState.brand && p.price !== null && p.price !== undefined);
   const pool = trendState.model ? brandPool.filter(p => p.sku === trendState.model) : brandPool;
   const lines = trendState.model ? pool.slice(0, 1) : pool.slice(0, 5);
   if (note) {
     note.textContent = trendState.model
-      ? `Showing ${trendState.brand}: ${lines[0] ? lines[0].name : ''}`
+      ? `Showing ${trendState.brand}: ${lines[0] ? lines[0].name : ''}${lines[0] && lines[0].config ? ' (' + lines[0].config + ')' : ''}`
       : `Showing up to 5 priced ${trendState.brand} models`;
   }
 
@@ -584,7 +607,7 @@ async function renderTrendChart() {
           ${lines.map((p, li) => `<div style="text-align:center;">
               <div style="width:10px;height:10px;border-radius:2px;background:${BRAND_COLOR_CYCLE[li % BRAND_COLOR_CYCLE.length]};margin:0 auto 8px;"></div>
               <div style="font-size:22px;font-weight:700;color:#fff;">${p.price.toFixed(0)} JOD</div>
-              <div style="font-size:11.5px;color:var(--muted);margin-top:2px;">${p.name}</div>
+              <div style="font-size:11.5px;color:var(--muted);margin-top:2px;">${p.name}${p.config ? ' · ' + p.config : ''}</div>
             </div>`).join('')}
         </div>
       </div>`;
@@ -616,9 +639,20 @@ async function renderTrendChart() {
     svg += `<line x1="${m.left}" x2="${width - m.right}" y1="${gy.toFixed(1)}" y2="${gy.toFixed(1)}" stroke="rgba(255,255,255,0.07)" stroke-width="1"/>`;
     svg += `<text x="${m.left - 8}" y="${(gy + 3.5).toFixed(1)}" text-anchor="end" font-size="10.5" fill="#8b93b8">${val.toFixed(0)}</text>`;
   }
+  // The first/last date labels are anchored to the INSIDE edge (start/end)
+  // rather than centered on their point, so they don't get clipped by the
+  // card's rounded corners — same fix already applied on the other two
+  // dashboards' identical chart code.
   labels.forEach((lab, i) => {
-    svg += `<text x="${xAt(i).toFixed(1)}" y="${height - 8}" text-anchor="middle" font-size="10" fill="#8b93b8">${lab.slice(5)}</text>`;
+    const anchor = i === 0 ? 'start' : (i === labels.length - 1 ? 'end' : 'middle');
+    svg += `<text x="${xAt(i).toFixed(1)}" y="${height - 8}" text-anchor="${anchor}" font-size="10" fill="#8b93b8">${lab.slice(5)}</text>`;
   });
+  // Hit-area circles are collected separately and appended AFTER every line's
+  // polygon/polyline/dot (see noon_scrape's identical fix) — SVG paints in
+  // document order, so an earlier line's hit circles would otherwise end up
+  // underneath a later line's filled area polygon and stop receiving hover
+  // events.
+  let hitCircles = '';
   lines.forEach((p, li) => {
     const series = perSeries[li];
     const color = BRAND_COLOR_CYCLE[li % BRAND_COLOR_CYCLE.length];
@@ -628,17 +662,49 @@ async function renderTrendChart() {
     const areaPoints = `${xAt(knownIdx[0]).toFixed(1)},${(m.top + plotH).toFixed(1)} ${points} ${xAt(knownIdx[knownIdx.length-1]).toFixed(1)},${(m.top + plotH).toFixed(1)}`;
     svg += `<polygon points="${areaPoints}" fill="${color}22" stroke="none"/>`;
     svg += `<polyline points="${points}" fill="none" stroke="${color}" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>`;
-    knownIdx.forEach(i => { svg += `<circle cx="${xAt(i).toFixed(1)}" cy="${yAt(series[i]).toFixed(1)}" r="3.5" fill="${color}"/>`; });
+    const lineLabel = `${p.name}${p.config ? ' · ' + p.config : ''}`;
+    knownIdx.forEach(i => {
+      const cx = xAt(i).toFixed(1), cy = yAt(series[i]).toFixed(1);
+      svg += `<circle cx="${cx}" cy="${cy}" r="3.5" fill="${color}"/>`;
+      hitCircles += `<circle class="trend-point" data-label="${lineLabel}" data-date="${labels[i]}" data-price="${series[i].toFixed(2)}" cx="${cx}" cy="${cy}" r="9" fill="transparent" style="cursor:pointer;"/>`;
+    });
   });
+  svg += hitCircles;
   svg += `</svg>`;
 
   const legend = `<div style="display:flex;gap:18px;flex-wrap:wrap;justify-content:center;margin-top:6px;">` +
     lines.map((p, li) => `<span style="font-size:12px;color:#c7cce6;display:inline-flex;align-items:center;gap:6px;">
         <span style="display:inline-block;width:10px;height:10px;border-radius:2px;background:${BRAND_COLOR_CYCLE[li % BRAND_COLOR_CYCLE.length]};"></span>
-        ${p.name}
+        ${p.name}${p.config ? ' · ' + p.config : ''}
       </span>`).join('') + `</div>`;
 
   wrap.innerHTML = `<div style="height:${height - 34}px;">${svg}</div>${legend}`;
+  attachTrendTooltip(wrap, outerWrap, tooltip);
+}
+
+// Hovering a data point shows a small floating card with that exact line's
+// model+config, the hovered date, and the recorded price for that day.
+function attachTrendTooltip(innerEl, outerEl, tooltip) {
+  if (!innerEl || !outerEl || !tooltip) return;
+  innerEl.querySelectorAll('.trend-point').forEach(pt => {
+    pt.addEventListener('mousemove', (e) => {
+      tooltip.innerHTML = `
+        <div style="font-weight:600;color:#fff;">${pt.dataset.label}</div>
+        <div style="color:var(--muted);margin-top:2px;">${pt.dataset.date}</div>
+        <div style="font-weight:700;color:#fff;margin-top:2px;">${pt.dataset.price} JOD</div>
+      `;
+      tooltip.style.display = 'block';
+      const rect = outerEl.getBoundingClientRect();
+      let x = e.clientX - rect.left + 14;
+      let y = e.clientY - rect.top - 12;
+      const maxX = rect.width - 180;
+      if (x > maxX) x = e.clientX - rect.left - 14 - 170;
+      if (y < 4) y = 4;
+      tooltip.style.left = `${x}px`;
+      tooltip.style.top = `${y}px`;
+    });
+    pt.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+  });
 }
 
 function renderTable(filtered) {
